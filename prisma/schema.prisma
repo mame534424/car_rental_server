@@ -1,0 +1,133 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum CarStatus {
+  AVAILABLE
+  MAINTENANCE
+  UNAVAILABLE
+}
+
+enum IdentificationType {
+  FAYDA
+  PASSPORT
+  NATIONAL_ID
+  DRIVERS_LICENSE
+  OTHER
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  PENDING_VERIFICATION
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  REJECTED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+enum BookingSource {
+  ONLINE
+  MANUAL
+}
+
+model Admin {
+  id               String   @id @default(uuid())
+  name             String
+  email            String   @unique
+  password         String
+  refreshTokenHash String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@map("admins")
+}
+
+model Car {
+  id           String    @id @default(uuid())
+  brand        String
+  model        String
+  description  String?
+  imageUrl     String?
+  quantity     Int
+  pricePerDay  Decimal   @db.Decimal(10, 2)
+  status       CarStatus @default(AVAILABLE)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  bookings     Booking[]
+
+  @@map("cars")
+}
+
+model Customer {
+  id                         String             @id @default(uuid())
+  name                       String
+  phone                      String
+  email                      String?
+  identificationType         IdentificationType
+  identificationNumber       String
+  identificationDocumentPath String?
+  createdAt                  DateTime           @default(now())
+  updatedAt                  DateTime           @updatedAt
+
+  bookings                   Booking[]
+
+  @@index([phone])
+  @@map("customers")
+}
+
+model Booking {
+  id              String        @id @default(uuid())
+  customerId      String
+  carId           String
+
+  pickupLocation  String
+  returnLocation  String
+
+  pickupDate      DateTime
+  returnDate      DateTime
+
+  totalAmount     Decimal       @db.Decimal(10, 2)
+
+  bookingStatus   BookingStatus @default(PENDING_PAYMENT)
+  paymentStatus   PaymentStatus @default(PENDING)
+  source          BookingSource @default(ONLINE)
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  customer        Customer      @relation(fields: [customerId], references: [id])
+  car             Car           @relation(fields: [carId], references: [id])
+  payments        Payment[]
+
+  @@index([carId, pickupDate, returnDate])
+  @@map("bookings")
+}
+
+model Payment {
+  id                    String        @id @default(uuid())
+  bookingId             String
+  amount                Decimal       @db.Decimal(10, 2)
+  provider              String        @default("chapa_mock")
+  status                PaymentStatus @default(PENDING)
+  transactionReference  String        @unique
+  checkoutUrl           String?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  booking               Booking       @relation(fields: [bookingId], references: [id])
+
+  @@map("payments")
+}
