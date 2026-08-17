@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { prisma } from "../config/prisma";
 import { BOOKING_SOURCE, BOOKING_STATUS, CAR_STATUS, PAYMENT_STATUS } from "../constants";
-import { uploadIdDocument, getSignedDocumentUrl } from "../services/storage.service";
+import { uploadIdDocument, getSignedDocumentUrl, getSignedPaymentReceiptUrl } from "../services/storage.service";
 import { ApiError } from "../utils/ApiError";
 import { sendSuccess } from "../utils/ApiResponse";
 import { asyncHandler } from "../utils/asyncHandler";
@@ -223,81 +223,290 @@ export const todaysRentals = asyncHandler(async (_req: Request, res: Response) =
 });
 
 // GET /api/admin/bookings/:id
-export const getBooking = asyncHandler(async (req: Request, res: Response) => {
-  const booking = await prisma.booking.findUnique({
-    where: { id: req.params.id },
-    include: { car: true, customer: true, payments: true },
-  });
-  if (!booking) throw ApiError.notFound("Booking not found");
+export const getBooking = asyncHandler(
+  async (req: Request, res: Response) => {
+    const booking = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      include: {
+        car: true,
+        customer: true,
+        payments: {
+          orderBy: { createdAt: "desc" },
+        },
+      },
+    });
 
-  let documentSignedUrl: string | null = null;
-  if (booking.customer.identificationDocumentPath) {
-    documentSignedUrl = await getSignedDocumentUrl(booking.customer.identificationDocumentPath);
+    if (!booking) {
+      throw ApiError.notFound("Booking not found");
+    }
+
+    
+    const documentPromise = booking.customer.identificationDocumentPath
+      ? getSignedDocumentUrl(booking.customer.identificationDocumentPath)
+      : Promise.resolve(null);
+
+    const paymentsPromise = Promise.all(
+      booking.payments.map(async (payment) => {
+        const receiptUrl = payment.receiptPath
+          ? await getSignedPaymentReceiptUrl(payment.receiptPath)
+          : null;
+
+        return {
+          ...payment,
+          receiptUrl,
+        };
+      })
+    );
+    
+    const [identificationDocumentUrl, payments] = await Promise.all([
+      documentPromise,
+      paymentsPromise,
+    ]);
+
+    return sendSuccess(
+      res,
+      {
+        ...booking,
+        customer: {
+          ...booking.customer,
+          identificationDocumentUrl,
+        },
+        payments,
+      },
+      "Booking retrieved successfully"
+    );
   }
+);
 
-  return sendSuccess(res, { ...booking, documentSignedUrl });
-});
+// PATCH /api/admin/bookings/:id/approve — moves PENDING_VERIFICATION -> CONFIRMED  
+export const approveBooking = asyncHandler(
+  async (req: Request, res: Response) => {
+    const booking = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      include: {
+        payments: {
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+        },
+      },
+    });
 
-// PATCH /api/admin/bookings/:id/approve — moves PENDING_VERIFICATION -> CONFIRMED
-export const approveBooking = asyncHandler(async (req: Request, res: Response) => {
-  const booking = await prisma.booking.findUnique({ where: { id: req.params.id } });
-  if (!booking) throw ApiError.notFound("Booking not found");
-  if (booking.bookingStatus !== BOOKING_STATUS.PENDING_VERIFICATION) {
-    throw ApiError.badRequest("Only bookings pending verification can be approved");
+    if (!booking) {
+      throw ApiError.notFound("Booking not found");
+    }
+
+    if (
+      booking.bookingStatus !==
+      BOOKING_STATUS.PENDING_VERIFICATION
+    ) {
+      throw ApiError.badRequest(
+        "Only bookings pending verification can be approved"
+      );
+    }
+
+    const payment = booking.payments[0];
+
+    if (!payment) {
+      throw ApiError.badRequest(
+        "This booking has no payment receipt"
+      );
+    }
+
+    if (payment.status !== PAYMENT_STATUS.SUBMITTED) {
+      throw ApiError.badRequest(
+        "Payment receipt is not awaiting verification"
+      );
+    }
+
+    const [updatedPayment, updatedBooking] =
+      await prisma.$transaction([
+        prisma.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: PAYMENT_STATUS.PAID,
+            verifiedAt: new Date(),
+          },
+        }),
+
+        prisma.booking.update({
+          where: { id: booking.id },
+          data: {
+            paymentStatus: PAYMENT_STATUS.PAID,
+            bookingStatus: BOOKING_STATUS.CONFIRMED,
+          },
+          include: {
+            car: true,
+            customer: true,
+          },
+        }),
+      ]);
+
+    return sendSuccess(
+      res,
+      {
+        booking: updatedBooking,
+        payment: updatedPayment,
+      },
+      "Payment verified and booking approved"
+    );
   }
-
-  const updated = await prisma.booking.update({
-    where: { id: booking.id },
-    data: { bookingStatus: BOOKING_STATUS.CONFIRMED },
-  });
-  return sendSuccess(res, updated, "Booking approved");
-});
+);
 
 // PATCH /api/admin/bookings/:id/reject
-export const rejectBooking = asyncHandler(async (req: Request, res: Response) => {
-  const booking = await prisma.booking.findUnique({ where: { id: req.params.id } });
-  if (!booking) throw ApiError.notFound("Booking not found");
-  if (![BOOKING_STATUS.PENDING_VERIFICATION, BOOKING_STATUS.PENDING_PAYMENT].includes(
-    booking.bookingStatus as never
-  )) {
-    throw ApiError.badRequest("This booking can no longer be rejected");
-  }
+export const rejectBooking = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { reason } = req.body;
 
-  const updated = await prisma.booking.update({
-    where: { id: booking.id },
-    data: { bookingStatus: BOOKING_STATUS.REJECTED },
-  });
-  return sendSuccess(res, updated, "Booking rejected");
-});
+    const booking = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      include: {
+        payments: {
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+        },
+      },
+    });
+
+    if (!booking) {
+      throw ApiError.notFound("Booking not found");
+    }
+
+    if (
+      ![
+        BOOKING_STATUS.PENDING_VERIFICATION,
+        BOOKING_STATUS.PENDING_PAYMENT,
+      ].includes(booking.bookingStatus as never)
+    ) {
+      throw ApiError.badRequest(
+        "This booking can no longer be rejected"
+      );
+    }
+
+    const payment = booking.payments[0];
+
+    const operations = [];
+
+    if (
+      payment &&
+      payment.status === PAYMENT_STATUS.SUBMITTED
+    ) {
+      operations.push(
+        prisma.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: PAYMENT_STATUS.FAILED,
+            verificationNote:
+              reason ?? "Payment receipt rejected by admin",
+          },
+        })
+      );
+    }
+
+    operations.push(
+      prisma.booking.update({
+        where: { id: booking.id },
+        data: {
+          bookingStatus: BOOKING_STATUS.REJECTED,
+        },
+        include: {
+          car: true,
+          customer: true,
+        },
+      })
+    );
+
+    const results = await prisma.$transaction(operations);
+
+    const updatedBooking = results[results.length - 1];
+
+    return sendSuccess(
+      res,
+      updatedBooking,
+      "Booking rejected"
+    );
+  }
+);
 
 // PATCH /api/admin/bookings/:id/cancel
-export const cancelBooking = asyncHandler(async (req: Request, res: Response) => {
-  const booking = await prisma.booking.findUnique({ where: { id: req.params.id } });
-  if (!booking) throw ApiError.notFound("Booking not found");
-  if ([BOOKING_STATUS.COMPLETED, BOOKING_STATUS.CANCELLED, BOOKING_STATUS.REJECTED].includes(
-    booking.bookingStatus as never
-  )) {
-    throw ApiError.badRequest("This booking cannot be cancelled");
-  }
+export const cancelBooking = asyncHandler(
+  async (req: Request, res: Response) => {
+    const booking = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+    });
 
-  const updated = await prisma.booking.update({
-    where: { id: booking.id },
-    data: { bookingStatus: BOOKING_STATUS.CANCELLED },
-  });
-  return sendSuccess(res, updated, "Booking cancelled");
-});
+    if (!booking) {
+      throw ApiError.notFound("Booking not found");
+    }
+
+    if (
+      [
+        BOOKING_STATUS.COMPLETED,
+        BOOKING_STATUS.CANCELLED,
+        BOOKING_STATUS.REJECTED,
+      ].includes(booking.bookingStatus as never)
+    ) {
+      throw ApiError.badRequest(
+        "This booking cannot be cancelled"
+      );
+    }
+
+    const updated = await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        bookingStatus: BOOKING_STATUS.CANCELLED,
+      },
+      include: {
+        car: true,
+        customer: true,
+      },
+    });
+
+    return sendSuccess(
+      res,
+      updated,
+      "Booking cancelled"
+    );
+  }
+);
 
 // PATCH /api/admin/bookings/:id/complete
-export const completeBooking = asyncHandler(async (req: Request, res: Response) => {
-  const booking = await prisma.booking.findUnique({ where: { id: req.params.id } });
-  if (!booking) throw ApiError.notFound("Booking not found");
-  if (booking.bookingStatus !== BOOKING_STATUS.CONFIRMED) {
-    throw ApiError.badRequest("Only confirmed bookings can be marked complete");
-  }
+export const completeBooking = asyncHandler(
+  async (req: Request, res: Response) => {
+    const booking = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+    });
 
-  const updated = await prisma.booking.update({
-    where: { id: booking.id },
-    data: { bookingStatus: BOOKING_STATUS.COMPLETED },
-  });
-  return sendSuccess(res, updated, "Booking marked complete");
-});
+    if (!booking) {
+      throw ApiError.notFound("Booking not found");
+    }
+
+    if (
+      booking.bookingStatus !== BOOKING_STATUS.CONFIRMED
+    ) {
+      throw ApiError.badRequest(
+        "Only confirmed bookings can be marked complete"
+      );
+    }
+
+    const updated = await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        bookingStatus: BOOKING_STATUS.COMPLETED,
+      },
+      include: {
+        car: true,
+        customer: true,
+      },
+    });
+
+    return sendSuccess(
+      res,
+      updated,
+      "Booking marked complete"
+    );
+  }
+);

@@ -1,38 +1,48 @@
 import { randomUUID } from "crypto";
-import { env } from "../config/env";
+import { STORAGE_BUCKET, supabase } from "../config/supabase";
+import { SIGNED_URL_EXPIRY_SECONDS } from "../constants";
+import { ApiError } from "../utils/ApiError";
 
-/**
- * Mock Chapa-shaped payment gateway.
- *
- * This mirrors the interface a real Chapa integration would have:
- * - initialize(): create a checkout session, return a checkout URL + tx ref
- * - verify(): confirm a transaction reference actually succeeded
- *
- * Swapping in the real Chapa SDK later means replacing only the internals
- * of these two functions — callers (controllers) don't change.
- */
+export async function uploadPaymentReceipt(
+  file: Express.Multer.File,
+  bookingId: string
+): Promise<string> {
+  const ext = file.originalname.split(".").pop() || "bin";
 
-export interface InitializeResult {
-  transactionReference: string;
-  checkoutUrl: string;
+  const path = `payment-receipts/${new Date()
+    .toISOString()
+    .slice(0, 10)}/${bookingId}-${randomUUID()}.${ext}`;
+
+  const { error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(path, file.buffer, {
+      contentType: file.mimetype,
+      upsert: false,
+    });
+
+  if (error) {
+    throw ApiError.internal(
+      `Failed to upload payment receipt: ${error.message}`
+    );
+  }
+
+  return path;
 }
 
-export async function initializeCheckout(params: {
-  amount: number;
-  customerEmail?: string;
-  customerName: string;
-}): Promise<InitializeResult> {
-  const transactionReference = `mock-chapa-${randomUUID()}`;
-  // In production this would be the real Chapa-hosted checkout page URL.
-  const checkoutUrl = `${env.BACKEND_URL}/api/payments/mock-checkout/${transactionReference}`;
+export async function getSignedPaymentReceiptUrl(
+  path: string
+): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .createSignedUrl(path, SIGNED_URL_EXPIRY_SECONDS);
 
-  return { transactionReference, checkoutUrl };
-}
+  if (error || !data?.signedUrl) {
+    throw ApiError.internal(
+      `Failed to generate payment receipt URL: ${
+        error?.message ?? "unknown error"
+      }`
+    );
+  }
 
-export async function verifyTransaction(
-  _transactionReference: string
-): Promise<{ success: boolean }> {
-  // Mock: always succeeds. Real Chapa integration would call their
-  // GET /v1/transaction/verify/{tx_ref} endpoint here.
-  return { success: true };
+  return data.signedUrl;
 }
