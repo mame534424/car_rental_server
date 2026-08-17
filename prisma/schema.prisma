@@ -123,7 +123,6 @@ model Payment {
   amount                Decimal       @db.Decimal(10, 2)
   provider              String        @default("chapa_mock")
   status                PaymentStatus @default(PENDING)
-  transactionReference  String        @unique
   checkoutUrl           String?
   receiptPath           String?
   receiptSubmittedAt    DateTime?

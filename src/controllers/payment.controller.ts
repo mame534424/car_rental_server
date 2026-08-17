@@ -53,7 +53,7 @@ export const submitReceipt = asyncHandler(
      */
     const existingSubmittedPayment = booking.payments.find(
       (payment) =>
-        payment.status === 
+        payment.status === PAYMENT_STATUS.SUBMITTED
     );
 
     if (existingSubmittedPayment) {
@@ -61,10 +61,7 @@ export const submitReceipt = asyncHandler(
         "A payment receipt has already been submitted for this booking"
       );
     }
-
-    /**
-     * Upload screenshot to Supabase Storage.
-     */
+    // upload screenshoot to supabase storage
     const receiptPath = await uploadPaymentReceipt(
       req.file,
       booking.id
